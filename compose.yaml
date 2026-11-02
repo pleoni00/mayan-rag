@@ -1,0 +1,135 @@
+name: mayan-poc
+
+x-app: &app
+  image: ${MAYAN_IMAGE:-mayanedms/mayanedms@sha256:03f7f43a686433e7dfc1151c3df37d8c376149e59b026008a5e846e578f03747}
+  env_file: .env
+  environment: &app-env
+    MAYAN_DATABASES: "{'default': {'ENGINE': 'django.db.backends.postgresql', 'NAME': 'mayan', 'USER': 'mayan', 'PASSWORD': '${POSTGRES_PASSWORD}', 'HOST': 'postgres', 'PORT': 5432}}"
+    MAYAN_CELERY_BROKER_URL: redis://redis:6379/0
+    MAYAN_CELERY_RESULT_BACKEND: redis://redis:6379/1
+    MAYAN_LOCK_MANAGER_BACKEND: mayan.apps.lock_manager.backends.redis_lock.RedisLock
+    MAYAN_LOCK_MANAGER_BACKEND_ARGUMENTS: "{'redis_url': 'redis://redis:6379/2'}"
+    MAYAN_COMMON_EXTRA_APPS: "[]"
+    MAYAN_AUTOADMIN_USERNAME: ${MAYAN_ADMIN_USER}
+    MAYAN_AUTOADMIN_PASSWORD: ${MAYAN_ADMIN_PASSWORD}
+    MAYAN_ALLOWED_HOSTS: "['localhost', '127.0.0.1', 'mayan', 'testserver']"
+    MAYAN_DOCUMENTS_FILE_STORAGE_BACKEND: storages.backends.s3.S3Storage
+    MAYAN_DOCUMENTS_FILE_STORAGE_BACKEND_ARGUMENTS: "{'access_key': '${MINIO_ROOT_USER}', 'secret_key': '${MINIO_ROOT_PASSWORD}', 'bucket_name': 'mayan-documents', 'endpoint_url': 'http://minio:9000', 'region_name': 'us-east-1', 'addressing_style': 'path', 'signature_version': 's3v4', 'default_acl': None, 'file_overwrite': False}"
+    MAYAN_GUNICORN_WORKERS: '1'
+    MAYAN_WORKER_A_CONCURRENCY: '1'
+    MAYAN_WORKER_B_CONCURRENCY: '1'
+    MAYAN_WORKER_C_CONCURRENCY: '1'
+    MAYAN_WORKER_D_CONCURRENCY: '1'
+    MAYAN_WORKER_E_CONCURRENCY: '1'
+    MAYAN_WORKER_F_CONCURRENCY: '1'
+    OMP_NUM_THREADS: '1'
+    PYTHONUNBUFFERED: '1'
+    AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+    AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+  volumes:
+    - mayan-data:/var/lib/mayan
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+    minio-init:
+      condition: service_completed_successfully
+
+services:
+  postgres:
+    image: postgres@sha256:e62fbf9d3e2b49816a32c400ed2dba83e3b361e6833e624024309c35d334b412
+    environment:
+      POSTGRES_DB: mayan
+      POSTGRES_USER: mayan
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes: [postgres-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U mayan -d mayan']
+      interval: 5s
+      retries: 20
+    mem_limit: 384m
+
+  redis:
+    image: redis@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
+    command: [redis-server, --appendonly, 'yes']
+    volumes: [redis-data:/data]
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 5s
+      retries: 20
+    mem_limit: 192m
+
+  minio:
+    image: cgr.dev/chainguard/minio@sha256:f767919bd003062ac69713cdce920eb922c9fa3388efe96264e78b763342ca1a
+    user: '0:0'
+    command: [server, /data, --console-address, ':9001']
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes: [minio-data:/data]
+    mem_limit: 384m
+
+  minio-init:
+    image: ${MAYAN_IMAGE:-mayanedms/mayanedms@sha256:03f7f43a686433e7dfc1151c3df37d8c376149e59b026008a5e846e578f03747}
+    env_file: .env
+    entrypoint: [/opt/mayan-edms/bin/python, /project/scripts/init_storage.py]
+    volumes: [./scripts:/project/scripts:ro]
+    depends_on: [minio]
+
+  opensearch:
+    image: opensearchproject/opensearch:2.19.4
+    environment:
+      discovery.type: single-node
+      bootstrap.memory_lock: 'true'
+      DISABLE_INSTALL_DEMO_CONFIG: 'true'
+      DISABLE_SECURITY_PLUGIN: 'true'
+      OPENSEARCH_JAVA_OPTS: '-Xms384m -Xmx384m'
+    ulimits:
+      memlock: {soft: -1, hard: -1}
+      nofile: {soft: 65536, hard: 65536}
+    volumes: [opensearch-data:/usr/share/opensearch/data]
+    healthcheck:
+      test: [CMD-SHELL, 'curl -fsS http://localhost:9200/_cluster/health >/dev/null']
+      interval: 10s
+      retries: 40
+    mem_limit: 1100m
+
+  events:
+    image: mayan-events:local
+    build:
+      context: .
+      network: host
+    env_file: .env
+    environment:
+      MAYAN_URL: http://mayan:8000
+      OPENSEARCH_URL: http://opensearch:9200
+      PYTHONUNBUFFERED: '1'
+      HF_HUB_DISABLE_TELEMETRY: '1'
+      TOKENIZERS_PARALLELISM: 'false'
+    volumes:
+      - ./.private/model:/models/manual:ro
+      - ./.private/events:/state
+    depends_on:
+      mayan:
+        condition: service_started
+      opensearch:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8080/health', timeout=3)"]
+      interval: 5s
+      retries: 60
+      start_period: 180s
+    mem_limit: 1100m
+
+  mayan:
+    <<: *app
+    ports: ['127.0.0.1:8010:8000']
+    mem_limit: 2600m
+
+volumes:
+  postgres-data:
+  redis-data:
+  minio-data:
+  opensearch-data:
+  mayan-data:
